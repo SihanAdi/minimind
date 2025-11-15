@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 import torch
 from torch import device, nn
 from torch.nn import functional as F
@@ -356,26 +357,69 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.layers = nn.ModuleList([
-            MiniMindBlock(l, config) for l in range(self.num_hidden_layers)
-        ])
-        
+        self.layers = nn.ModuleList(
+            [MiniMindBlock(l, config) for l in range(self.num_hidden_layers)]
+        )
+
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=config.hidden_size // config.num_attention_heads, 
+            dim=config.hidden_size // config.num_attention_heads,
             end=config.max_position_embeddings,
             rope_base=config.rope_theta,
-            rope_scaling=config.rope_scaling
+            rope_scaling=config.rope_scaling,
         )
 
         # 使用 register_buffer 而不是直接简单的实例变量原因：自动转移到设备
         # persistent=False 这个 Buffer 不会被保存到模型状态字典中，因为freqs_cos 和 freqs_sin 是完全可以通过配置参数重新计算，显著减小模型文件大小
+        # 自动注册为当前对象的属性
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, input_ids=None, attention_mask, past_key_values=None):
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        **kwargs,
+    ):
+        batch_size, seq_len = input_ids.shape
 
+        # 适配多种输入格式的 past_key_values
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+        past_key_values = past_key_values or ([None] * len(self.layers))
 
+        # 确定当前处理的起始位置 - 增量训练
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
 
+        # 准备输入数据
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        position_embedding = (
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
+
+        presents = []
+        for _, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embedding,
+                past_key_value,
+                use_cache,
+                attention_mask,
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        # MoE机制
+        # aux_losses = [layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MOEFeedForward)]
+        # aux_loss = sum(aux_losses)
+
+        # return hidden_states, presents, aux_loss
+        return hidden_states, presents
 
 
 class MOEFeedForward(nn.Module):
