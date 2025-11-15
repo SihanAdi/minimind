@@ -448,6 +448,7 @@ class MoEGate(nn.Module):
         return init.kaiming_uniform_(self.weight, a=math.sqrt(5))    # 源于原始论文中的推荐，它对于某些网络结构能够提供更好的训练稳定性
     
     def forward(self, hidden_states):
+        """目标负载均衡"""
         # 处理输入
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)    # [batch_size * seq_len, hidden_dim]
