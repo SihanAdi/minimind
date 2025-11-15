@@ -422,5 +422,133 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents
 
 
+class MoEGate(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        self.topk = config.num_experts_per_topk    # 每个token选择的专家数量
+        self.n_routed_experts = config.n_routed_experts    # 总专家数
+        
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha    # 确保专家负载均衡，避免某些专家过载而其他专家闲置
+        self.seq_aux = config.seq_aux    # 如果为True，在序列级别计算负载均衡损失；否则在token级别计算
+        
+        self.norm_topk_rob = config.norm_topk_prob    # 是否对top-k概率进行归一化
+        self.gating_dim = config.hidden_size    # 门控网络的输入维度
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))    # [n_routed_experts, hidden_size]
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """
+        适用于：
+            - 线性层（全连接层）
+            - 卷积层
+            - 使用Leaky ReLU或类似激活函数的网络
+        """
+        return init.kaiming_uniform_(self.weight, a=math.sqrt(5))    # 源于原始论文中的推荐，它对于某些网络结构能够提供更好的训练稳定性
+    
+    def forward(self, hidden_states):
+        # 处理输入
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)    # [batch_size * seq_len, hidden_dim]
+        
+        # 计算分数
+        logits = F.linear(input=hidden_states, weight=self.weight, bias=None)    # [batch_size * seq_len, n_routed_experts]
+        if self.scoring_func == "softmax":
+            scores = F.softmax(logits, dim=-1)
+        else:
+            raise NotImplementedError(f'Insupportable scoring function for MoE gating: {self.scoring_func}')
+        
+        # 计算topk个专家的权重和idx，并归一化权重
+        topk_weight, topk_idx = torch.topk(scores, k=self.topk, dim=-1, sorted=False)
+        
+        if self.topk > 1 and self.norm_topk_rob:
+            denominator = torch.sum(topk_weight, dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+            
+        if self.training and self.alpha > 0.0:
+            topk_idx_for_aux_loss = topk_idx.view(batch_size, -1)    # [batch_size, seq_len * top_k]
+            # 负载均衡辅助损失，目的是确保所有专家都能被均衡使用
+            if self.seq_aux:
+                # 序列级别辅助损失
+                score_for_seq_aux = scores.view(batch_size, seq_len, -1)
+                
+                # 计算专家使用频率
+                ce = torch.zeros(batch_size, self.n_routed_experts, device=hidden_states.device)
+                
+                """
+                在专家索引位置累加1，统计每个专家被选中的次数，并归一化
+                
+                例如：
+                batch_size = 2; seq_len = 3; topk = 2; n_routed_experts = 4
+                
+                ce: [batch_size, n_routed_experts]
+                [
+                    [0., 0., 0., 0.],
+                    [0., 0., 0., 0.]
+                ]
+                
+                topk_idx_for_aux_loss: [batch_size, seq_len * top_k]
+                [
+                    [1, 0, 2, 3, 1, 0],
+                    [3, 1, 1, 2, 0, 3]
+                ]
+                
+                src: [batch_size, seq_len * topk]
+                [
+                    [1., 1., 1., 1., 1., 1.],
+                    [1., 1., 1., 1., 1., 1.]
+                ]
+                
+                dim = 1具体计算过程：
+                    - 对于batch 0：
+                        index[0,0]=1 → ce[0,1] += 1 → ce[0,1] = 1
+                        index[0,1]=0 → ce[0,0] += 1 → ce[0,0] = 1
+                        index[0,2]=2 → ce[0,2] += 1 → ce[0,2] = 1
+                        index[0,3]=3 → ce[0,3] += 1 → ce[0,3] = 1
+                        index[0,4]=1 → ce[0,1] += 1 → ce[0,1] = 2
+                        index[0,5]=0 → ce[0,0] += 1 → ce[0,0] = 2
+                    - 对于batch 1：
+                        index[1,0]=3 → ce[1,3] += 1 → ce[1,3] = 1
+                        index[1,1]=1 → ce[1,1] += 1 → ce[1,1] = 1
+                        index[1,2]=1 → ce[1,1] += 1 → ce[1,1] = 2
+                        index[1,3]=2 → ce[1,2] += 1 → ce[1,2] = 1
+                        index[1,4]=0 → ce[1,0] += 1 → ce[1,0] = 1
+                        index[1,5]=3 → ce[1,3] += 1 → ce[1,3] = 2
+                输出ce:
+                [
+                    [2., 2., 1., 1.],
+                    [1., 2., 1., 2.]
+                ]
+                """
+                ce.scatter_add_(
+                    dim=1,   # 沿专家维度操作
+                    index=topk_idx_for_aux_loss, 
+                    src=torch.ones(batch_size, seq_len * self.topk, device=hidden_states.device)
+                ).div_(
+                    # seq_len * self.topk：每个batch中总的专家选择次数(总选择次数)
+                    # 理想负载均衡情况：理想选择次数 = 总选择次数 / 专家总数
+                    seq_len * self.topk / self.n_routed_experts
+                )
+                
+                # 计算损失
+                expert_scores = score_for_seq_aux.mean(dim=1)    # [batch_size, n_routed_experts]
+                aux_loss = (ce * expert_scores).sum(dim=1).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts) # [batch_size * seq_len * top_k, n_routed_experts]
+                ce = mask_ce.float().mean(0) # [n_routed_experts]
+                Pi = scores.mean(0) # [n_routed_experts] 计算专家得分期望
+                """
+                fi = 1.0：使用频率正好等于理想值
+                fi > 1.0：过度使用
+                fi < 1.0：使用不足
+                """
+                fi = ce * self.n_routed_experts # 归一化使用频率
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        
+        return topk_idx, topk_weight, aux_loss
+
 class MOEFeedForward(nn.Module):
     pass
