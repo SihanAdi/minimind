@@ -1,0 +1,382 @@
+import math
+import torch
+from torch import device, nn
+from torch.nn import functional as F
+from torch.nn import init
+
+# 将激活函数名称映射到具体实现函数
+from transformers.activations import ACT2FN
+
+
+class RMSNorm(nn.Module):
+    """
+    RMSNorm 解决 LayerNorm 被存在的计算上的冗余
+        - LayerNorm 关键部分在于 重新中心化 和 重新缩放 操作，而其中的重新中心化（减去均值）可能不是必须的
+    RMSNorm 只缩放，不中心化：使用均方根 来代替标准差进行缩放
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self._norm(x.float()).type_as(x) * self.weight
+
+
+def apply_yarn(dim, orig_max, factor, beta_fast, beta_slow, freqs):
+    """
+    YaRN: 高效扩展基于 RoPE 的模型上下文窗口，RoPE中不同频率的维度对位置信息的编码方式不同，不能"一刀切"地处理
+    高频维度：具备周期性和鲁棒的，可以直接按原始方式计算 - 波长 ≤ 原始最大长度 小β
+    低频维度：承载了全局绝对位置信息，需要进行内插，压缩到模型熟悉的范围内 - 波长 > 原始最大长度 大β
+
+    YaRN的标准缩放公式：scale_low_freq = (beta * factor - beta + 1) / (beta * factor)
+        - 解决线形插值把所有位置信息压缩到原来的 1/factor，导致所有维度都被同等对待，高频维度损失严重
+
+    相关信息：
+        - RoPE的旋转角度符合物理学定义上的角频率：角度随时间（或位置）的变化率
+        - 波长 = 波速 × 周期 = 周期 / 角频率；波长就是从起点到完成一次完整旋转所经过的位置距离
+            - 如果波长 > 原始最大长度，说明在模型的训练范围内，这个维度从未完成过完整周期
+    """
+    # 找到第一个高频维度的索引位置
+    first_high_freq_idx = next(
+        (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2
+    )
+
+    # 为每个维度分配一个权重，用于在 beta_slow 和 beta_fast 之间进行平滑插值
+    weights = torch.arange(0, dim // 2, device=freqs.device).float() / max(
+        dim // 2 - 1, 1
+    )
+
+    # 计算每个维度的beta值: 低频维度（weights接近0）：beta ≈ beta_slow, 高频维度（weights接近1）：beta ≈ beta_fast, 中间维度：平滑过渡
+    beta = beta_slow + (beta_fast - beta_slow) * weights
+
+    # scale_low_freq = (beta * factor - beta + 1) / (beta * factor)
+    scale = torch.where(
+        torch.arange(0, dim // 2, device=freqs.device) < first_high_freq_idx,
+        (beta * factor - beta + 1) / (beta * factor),
+        1.0 / factor,
+    )
+
+    freqs = freqs * scale
+    return freqs
+
+
+def precompute_freqs_cis(dim, end=int(32 * 1024), rope_base=1e6, rope_scaling=None):
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
+    if rope_scaling:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4.0),
+            rope_scaling.get("beta_slow", 1.0),
+        )
+        if end / orig_max > 1.0:
+            freqs = apply_yarn(dim, orig_max, factor, beta_fast, beta_slow, freqs)
+    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs).float()
+
+    freqs_cos = torch.cos(freqs)
+    freqs_sin = torch.sin(freqs)
+
+    freqs_cos = torch.cat([freqs_cos, freqs_cos], dim=-1)
+    freqs_sin = torch.cat([freqs_sin, freqs_sin], dim=-1)
+    # 输出size[sequence len, head_dim]
+    return freqs_cos, freqs_sin
+
+
+def apply_rope(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    通过旋转矩阵对词向量在高维空间中进行旋转，旋转的角度取决于该 token 的绝对位置
+        - 旋转: 天然地包含了绝对位置信息，并且神奇地保持了相对位置的规律性
+    两个词，一个在位置 m，一个在位置 n: 位置 m 的词向量被旋转了 m*θ; 位置 n 的词向量被旋转了 n*θ
+        - 旋转后的两个向量的点积，只与它们原始向量的点积和相对位置 (m-n) 有关
+        - 只依赖于词本身的语义和它们的相对距离，而与它们的绝对位置无关
+    词向量的维度 d 通常很高, RoPE：将高维向量视为 d/2 个二维向量的拼接
+        - [x1, x2, x3, x4]。每一对 (x1, x3) 构成一个二维子空间，(x2, x4) 构成另一个...
+        - 对于第 i 个二维子空间，我们使用一个不同的基础旋转角度 θ_i。通常，θ_i 会随着 i 的增大而减小
+    只对 Query 和 Key 向量应用位置编码，而 Value 向量保持不变
+    """
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    # 输出size[b, s, n_heads, head_dim]
+    return q_embed, k_embed
+
+
+def rotate_half(x):
+    """
+    [A, B] -> [-B, A]
+    """
+    half_index = x.shape[-1] // 2
+    return torch.cat((-x[..., half_index:], x[..., :half_index]), dim=-1)
+
+
+def repeat_kv(x, n_rep):
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    batch_size, seq_len, n_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    else:
+        return (
+            x[:, :, :, None, :]
+            .expand(batch_size, seq_len, n_heads, n_rep, head_dim)
+            .reshape(batch_size, seq_len, n_heads * n_rep, head_dim)
+        )
+
+
+class Attention(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        # 注意力头相关参数
+        # GQA 分组查询注意力：多个query头共享相同的key和value头
+        self.num_key_value_heads = (
+            args.num_key_value_heads
+            if args.num_key_value_heads is not None
+            else args.num_attention_heads
+        )
+        assert args.num_attention_heads % args.num_key_value_heads == 0, (
+            "num_attention_heads must be divisible by num_key_value_heads"
+        )
+        self.n_local_heads = args.num_attention_heads  # Query的总头数
+        self.n_rep = (
+            self.n_local_heads // self.num_key_value_heads
+        )  # 每个KV头对应的Q头数
+        # 维度参数
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        # 投影层
+        self.q_proj = nn.Linear(
+            args.hidden_size, self.head_dim * self.n_local_heads, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.head_dim * self.num_key_value_heads, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.head_dim * self.num_key_value_heads, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.head_dim * self.n_local_heads, args.hidden_size, bias=False
+        )
+        # dropout
+        self.dropout = args.dropout
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        # 优化参数
+        self.flash = args.flash_attn and hasattr(
+            torch.nn.functional, "scaled_dot_product_attention"
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embedding,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        batch_size, seq_len, _ = x.shape
+        # 计算qkv
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = q.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        # 对qk计算rope
+        cos, sin = position_embedding  # [seq_len, head_dim]
+        q, k = apply_rope(q, k, cos[:seq_len], sin[:seq_len])
+
+        # kv cache实现
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
+        if use_cache:
+            past_key_value = (k, v)
+        else:
+            past_key_value = None
+
+        # 每个头都能独立处理自己的 [seq_len, head_dim] 矩阵, 提高并行效率
+        q = q.transpose(1, 2)  # batch_size, n_local_heads, seq_len, head_dim
+        k, v = (
+            repeat_kv(k, self.n_rep).transpose(1, 2),
+            repeat_kv(v, self.n_rep).transpose(1, 2),
+        )
+
+        if (
+            self.flash
+            and seq_len > 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):  # 不支持批量序列对齐padding
+            attention_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(batch_size, 1, 1, -1)
+                .expand(batch_size, self.n_local_heads, seq_len, -1)
+                .bool()
+            )
+
+            output = F.scaled_dot_product_attention(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            scores = (
+                q @ k.transpose(-1, -2) / math.sqrt(self.head_dim)
+            )  # [batch_size, n_local_heads, seq_len, seq_len]
+
+            # causal mask + scores
+            scores += (
+                torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                    diagonal=1,
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+
+            # attention_mask 处理由于输入数据序列长度不一致所产生的padding部分
+            if attention_mask is not None:
+                extend_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                scores += (1.0 - extend_attention_mask) * -1e9  # 1: not mask; 0: mask
+
+            scores = F.softmax(scores, dim=-1).type_as(q)
+            scores = self.attn_dropout(scores)
+
+            output = scores @ v  # [batch_size, n_local_heads, seq_len, head_dim]
+
+        output = output.transpose(2, 1).reshape(batch_size, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+
+        return output, past_key_value
+
+
+class FeedForward(nn.Module):
+    """
+    门控前馈网络
+    相较传统前馈网络，门控前馈网络在激活函数前增加了一个门控机制，使得模型在训练过程中可以更有效地控制信息的流动，从而提高模型的训练效率和泛化能力。
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if config.intermediate_size is None:
+            """
+            传统FFN参数量：hidden × intermediate × 2
+                - x → Linear(hidden→intermediate) → Activation → Linear(intermediate→hidden) → Output
+            门控FFN参数量：hidden × intermediate × 3
+            通常intermediate_old = 4 × hidden
+            """
+            intermediate_size = int(config.hidden_size * 4 * (2 / 3))
+            """
+            hidden_size = 512
+            理论值 = 512 × 8/3 ≈ 1365.33
+            对齐后 = 64 × ceil(1365.33/64) = 64 × 22 = 1408
+            """
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        """
+        x → Gate_Linear → Activation ↘
+                                    Multiply → Down_Linear → Output
+        x → Up_Linear   →───────────↗
+        """
+        return self.dropout(
+            self.down_proj(self.up_proj(x) * self.act_fn(self.gate_proj(x)))
+        )
+
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id, config):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.layer_id = layer_id
+
+        self.self_attn = Attention(config)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        position_embedding,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        residual = hidden_states
+        hidden_states, past_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embedding,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+        hidden_states += residual
+
+        hidden_states += self.mlp(self.post_attention_layernorm(hidden_states))
+
+        return hidden_states, past_key_value
+
+
+class MiniMindModel(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+
+        self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.layers = nn.ModuleList([
+            MiniMindBlock(l, config) for l in range(self.num_hidden_layers)
+        ])
+        
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads, 
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling
+        )
+
+        # 使用 register_buffer 而不是直接简单的实例变量原因：自动转移到设备
+        # persistent=False 这个 Buffer 不会被保存到模型状态字典中，因为freqs_cos 和 freqs_sin 是完全可以通过配置参数重新计算，显著减小模型文件大小
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, input_ids=None, attention_mask, past_key_values=None):
+
+
+
+
+
+class MOEFeedForward(nn.Module):
+    pass
