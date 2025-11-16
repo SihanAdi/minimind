@@ -20,13 +20,16 @@ class MiniMindConfig(PretrainedConfig):
             dropout: float = 0.0,
             bos_token_id: int = 1,
             eos_token_id: int = 2,
-            hidden_act: str = 'silu',
-            hidden_size: int = 512,
+            hidden_act: str = 'silu', # 相比ReLU有更好的梯度特性，在Transformer中表现优秀，LLaMA、GPT等现代模型的首选激活函数
+            hidden_size: int = 512, # 足够表达复杂模式，同时计算效率较高，适合中等规模的模型
             intermediate_size: int = None,
-            max_position_embeddings: int = 32768,
+            max_position_embeddings: int = 32768, # 32K上下文
+            
+            # 8:2比例：使用分组查询注意力(GQA)，减少KV缓存内存占用
             num_attention_heads: int = 8,
-            num_hidden_layers: int = 8,
             num_key_value_heads: int = 2,
+            
+            num_hidden_layers: int = 8,
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000,
@@ -37,8 +40,10 @@ class MiniMindConfig(PretrainedConfig):
             ####################################################
             use_moe: bool = False,
             num_experts_per_tok: int = 2,
+            # 4+1配置：提供专家多样性，同时有共享专家处理通用知识
             n_routed_experts: int = 4,
             n_shared_experts: int = 1,
+            
             scoring_func: str = 'softmax',
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
