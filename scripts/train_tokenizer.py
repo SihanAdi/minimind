@@ -157,7 +157,7 @@ def evaluate_tokenizer(messages, tokenizer_dir="../model_weights/"):
 
 
 if __name__ == '__main__':
-    # train_tokenizer('../dataset/pretrain_hq.jsonl')
+    train_tokenizer('../dataset/pretrain_hq.jsonl')
     messages = [
         {"role": "system", "content": "你是一个优秀的AI助手，总是给我正确的回应！"},
         {"role": "user", "content": '你是谁？'},
