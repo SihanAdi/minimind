@@ -17,13 +17,14 @@ TOKENIZERS_PARALLELISM: 控制 Hugging Face tokenizers 库并行
 """
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(data_path)
-    
+
     def load_data(self, data_path):
         samples = []
         with open(data_path, "r", encoding="utf-8") as f:
@@ -34,29 +35,28 @@ class PretrainDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, index):
         sample = self.samples[index]
-        
+
         encoding = self.tokenizer(
             str(sample["text"]),
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
         input_ids = encoding.input_ids.squeeze()
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)
-        
+        loss_mask = input_ids != self.tokenizer.pad_token_id
+
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
-        
+
         return X, Y, loss_mask
-        
-        
+
+
 if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("../model_weights")
     pretrain_dataset = PretrainDataset("./pretrain_hq.jsonl", tokenizer)
     print(pretrain_dataset[0])
-    
