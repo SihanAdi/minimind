@@ -7,7 +7,96 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import argparse
 import time
 from contextlib import nullcontext
+import time
+from contextlib import nullcontext
 import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+from trainer.trainer_utils import init_distributed_mode, setup_speed, lm_checkpoint, is_main_process, Logger, init_model, SkipBatchSampler, get_lr
+from model.minimodel_model import MiniMindConfig
+from dataset.lm_dataset import PretrainDataset
+
+
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    loss_function = nn.CrossEntropyLoss(reduction="none")
+    start_time = time.time()
+    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        X = X.to(args.device)
+        Y = Y.to(args.device)
+        loss_mask = loss_mask.to(args.device)
+        
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        # 覆盖参数组原有的学习率设置
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+            
+        with autocast_context:
+            res = model(X)
+            loss = loss_function(
+                res.logits.view(-1, res.logits.size(-1)), # [batch size * seq len, vocb len]
+                Y.view(-1) # [batch size * seq len]
+            ).view(Y.size())
+            
+            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            loss += res.aux_loss
+            loss /= args.accumulation_steps
+            
+        # 损失缩放和反向传播
+        scaler.scale(loss).backward()
+        
+        if (step + 1) % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # 减少内存占用，提高效率
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            
+        if (step % args.log_interval == 0 or step == iters + 1) and is_main_process():
+            spend_time = time.time() - start_time
+            current_loss = loss * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]["lr"]
+            
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            
+            Logger(f'Epoch:[{epoch + 1} / {args.epochs}]({step} / {iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
+            
+            if wandb: 
+                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+                
+        if (step % args.save_interval == 0 or step == iters + 1) and is_main_process():
+            # 提高保存过程的稳定性
+            model.eval()
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            checkpoint = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
+            torch.save(state_dict, checkpoint)
+            lm_checkpoint(
+                lm_config, 
+                weight=args.save_weight, 
+                model=model, 
+                optimizer=optimizer,
+                epoch=epoch,
+                step=step,
+                wandb=wandb,
+                save_dir='../checkpoints',
+            )
+            model.train()
+            del state_dict
+
+        del X, Y, loss_mask, res, loss
+    
+
+
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
@@ -231,3 +320,6 @@ if __name__ == "__main__":
                     pin_memory=True
                 )
                 train_epoch(epoch, loader, len(loader), 0, wandb)
+                
+                
+# torchrun --nproc_per_node 1 train_pretrain.py
