@@ -322,4 +322,4 @@ if __name__ == "__main__":
                 train_epoch(epoch, loader, len(loader), 0, wandb)
                 
                 
-# torchrun --nproc_per_node 1 train_pretrain.py
+# torchrun --nproc_per_node 1 train_pretrain.py 
