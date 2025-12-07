@@ -260,4 +260,4 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader), tokenizer, lm_config, 0, wandb)
                 
                 
-# torchrun --nproc_per_node 1 train_full_sft.py 
+# torchrun --nproc_per_node 1 train_distill_reason.py 
