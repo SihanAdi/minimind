@@ -12,6 +12,7 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from trainer.trainer_utils import init_distributed_mode, setup_speed, lm_checkpoint, is_main_process, Logger, init_model, SkipBatchSampler, get_lr
@@ -20,13 +21,51 @@ from dataset.lm_dataset import DPODataset
 import warnings
 warnings.filterwarnings('ignore')
 
+
+def logits_to_log_probs(logits, labels):
+    # logits shape: (batch_size, seq_len, vocab_size)
+    # labels shape: (batch_size, seq_len)
+    # log_probs shape: (batch_size, seq_len)
+    log_probs = F.log_softmax(logits, dim=-1)
+    log_probs_per_token = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(2)).squeeze(-1)
+    return log_probs_per_token
+
+
+def dpo_loss(ref_log_probs, policy_log_probs, mask: torch.Tensor, beta):
+    # β越大：模型对偏好差异更敏感，但可能过度优化; β越小：模型更保守，保持接近参考模型
+    # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    seq_lengths = mask.sum(dim=-1, keepdim=True).clamp_min(1e-8) # 防止零长度mask导致除零NaN
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    
+    # 将 chosen 和 rejected 数据分开
+    batch_size = ref_log_probs.shape[0]
+    chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
+    reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+    chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
+    reject_policy_log_probs = policy_log_probs[batch_size // 2:]
+    
+    pi_log_ratios = chosen_policy_log_probs - reject_policy_log_probs
+    ref_log_ratios = chosen_ref_log_probs - reject_ref_log_probs
+    
+    logits = pi_log_ratios - ref_log_ratios
+    loss = -F.logsigmoid(beta * logits) # 对于二分类问题（chosen vs rejected），所以使用sigmoid
+    return loss.mean()
+
+
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
-    loss_function = nn.CrossEntropyLoss(reduction="none")
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+    for step, batch in enumerate(loader, start=start_step + 1):
+        x_chosen = batch['x_chosen'].to(args.device)
+        x_rejected = batch['x_rejected'].to(args.device)
+        y_chosen = batch['y_chosen'].to(args.device)
+        y_rejected = batch['y_rejected'].to(args.device)
+        mask_chosen = batch['mask_chosen'].to(args.device)
+        mask_rejected = batch['mask_rejected'].to(args.device)
+        
+        X = torch.cat([x_chosen, x_rejected], dim=0)
+        Y = torch.cat([y_chosen, y_rejected], dim=0)
+        loss_mask = torch.cat([mask_chosen, mask_rejected], dim=0)
         
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         # 覆盖参数组原有的学习率设置
@@ -34,14 +73,16 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             param_group["lr"] = lr
             
         with autocast_context:
-            res = model(X)
-            loss = loss_function(
-                res.logits.view(-1, res.logits.size(-1)), # [batch size * seq len, vocb len]
-                Y.view(-1) # [batch size * seq len]
-            ).view(Y.size())
+            with torch.no_grad():
+                ref_outputs = ref_model(X)
+                ref_logits = ref_outputs.logits
+            ref_log_probs = logits_to_log_probs(ref_logits, Y)
             
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
+            outputs = model(X)
+            logits = outputs.logits
+            policy_log_probs = logits_to_log_probs(logits, Y)
+            
+            loss = dpo_loss(ref_logits, policy_log_probs, loss_mask, beta)
             loss /= args.accumulation_steps
             
         # 损失缩放和反向传播
@@ -95,10 +136,9 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             model.train()
             del state_dict
 
-        del X, Y, loss_mask, res, loss
+        del x_chosen, x_rejected, y_chosen, y_rejected, mask_chosen, mask_rejected, X, Y, loss_mask
+        del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, loss
     
-
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind DPO")
