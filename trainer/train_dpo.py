@@ -32,7 +32,14 @@ def logits_to_log_probs(logits, labels):
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask: torch.Tensor, beta):
-    # β越大：模型对偏好差异更敏感，但可能过度优化; β越小：模型更保守，保持接近参考模型
+    """
+    增大chosen概率：提高 chosen_policy_log_probs，使 logits 变大
+    减小rejected概率：降低 reject_policy_log_probs，使 logits 变大
+    
+    防止过度偏离参考模型：通过参考模型比率进行约束
+        - β越大：模型对偏好差异更敏感，但可能过度优化; 
+        - β越小：模型更保守，保持接近参考模型
+    """
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     seq_lengths = mask.sum(dim=-1, keepdim=True).clamp_min(1e-8) # 防止零长度mask导致除零NaN
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
