@@ -39,13 +39,13 @@ def sequence_level_aux_loss(hidden_states, topk_idx, scores):
 
 ### 数学表达式
 对于每个batch $b$：
-$$
+$
 \text{ce}_{b,j} = \frac{\text{count}_{b,j}}{\frac{\text{seq\_len} \times \text{topk}}{n\_experts}}
-$$
+$
 
-$$
+$
 \text{aux\_loss} = \alpha \times \frac{1}{B} \sum_{b=1}^{B} \sum_{j=1}^{E} \text{ce}_{b,j} \times \text{score}_{b,j}
-$$
+$
 
 其中：
 - $\text{count}_{b,j}$：batch $b$中专家$j$被选中的次数
@@ -89,21 +89,21 @@ def token_level_aux_loss(hidden_states, topk_idx, scores):
 
 ### 数学表达式
 全局计算：
-$$
+$
 \text{ce}_j = \frac{1}{B \times L \times K} \sum_{b=1}^{B} \sum_{i=1}^{L} \sum_{k=1}^{K} \mathbb{1}[\text{topk\_idx}_{b,i,k} = j]
-$$
+$
 
-$$
+$
 \text{Pi}_j = \frac{1}{B \times L \times K} \sum_{b=1}^{B} \sum_{i=1}^{L} \sum_{k=1}^{K} \text{score}_{b,i,j}
-$$
+$
 
-$$
+$
 \text{fi}_j = \text{ce}_j \times E
-$$
+$
 
-$$
+$
 \text{aux\_loss} = \alpha \times \sum_{j=1}^{E} \text{Pi}_j \times \text{fi}_j
-$$
+$
 
 ### 特点分析
 **优点：**
@@ -167,9 +167,9 @@ Batch2: [0.3, 0.2, 1.7, 1.8, 0.1, 0.2, 1.9, 1.8] → 损失较高
 ## 数学原理分析
 
 ### 损失函数回顾
-$$
+$
 \text{aux\_loss} = \sum_{j=1}^{E} \text{Pi}_j \times \text{fi}_j = \sum_{j=1}^{E} \text{Pi}_j \times (\text{ce}_j \times E)
-$$
+$
 
 其中 $\text{fi}_j = \text{ce}_j \times E$
 
@@ -356,7 +356,7 @@ f(0.5) = 0.25    # 减少0.75
 
 ## Policy Optimization (PO)
 - 优化期望：训练时，只需**最小化负目标函数**，即: $\mathcal{L_{PO}}=-\mathcal{J_{PO}}$
-$$\mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}} \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right]$$
+$\mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}} \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right]$
 
     - 问题/提示词  $q$: 从数据集 $P(Q)$ 中采样
     - 模型输出序列 $o$: 由策略 $\pi$ 生成 
@@ -374,7 +374,7 @@ $$\mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrac
 - 局限在于不做在线探索，更多用于"偏好/安全"的人类价值对齐
 - 对"能不能做对题"的智力能力提升有限（当然这也取决于数据集，大规模收集正反样本并人类评估很困难）
 - 损失函数: 
-    $$\mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right]$$
+    $\mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right]$
     - 策略项: $f(r_t) = \log r_w - \log r_l$
         - 对比chosen vs rejected的概率比
     - 优势项: $g(A_t)$ = 无
