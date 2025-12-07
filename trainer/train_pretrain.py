@@ -97,93 +97,6 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     
 
 
-import torch.distributed as dist
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
-from trainer.trainer_utils import init_distributed_mode, setup_speed, lm_checkpoint, is_main_process, Logger, init_model, SkipBatchSampler, get_lr
-from model.minimodel_model import MiniMindConfig
-from dataset.lm_dataset import PretrainDataset
-
-
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_function = nn.CrossEntropyLoss(reduction="none")
-    start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-        
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        # 覆盖参数组原有的学习率设置
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-            
-        with autocast_context:
-            res = model(X)
-            loss = loss_function(
-                res.logits.view(-1, res.logits.size(-1)), # [batch size * seq len, vocb len]
-                Y.view(-1) # [batch size * seq len]
-            ).view(Y.size())
-            
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
-            loss /= args.accumulation_steps
-            
-        # 损失缩放和反向传播
-        scaler.scale(loss).backward()
-        
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # 减少内存占用，提高效率
-            optimizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            
-        if (step % args.log_interval == 0 or step == iters + 1) and is_main_process():
-            spend_time = time.time() - start_time
-            current_loss = loss * args.accumulation_steps
-            current_lr = optimizer.param_groups[-1]["lr"]
-            
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            
-            Logger(f'Epoch:[{epoch + 1} / {args.epochs}]({step} / {iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
-            
-            if wandb: 
-                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
-                
-        if (step % args.save_interval == 0 or step == iters + 1) and is_main_process():
-            # 提高保存过程的稳定性
-            model.eval()
-            moe_suffix = "_moe" if lm_config.use_moe else ""
-            checkpoint = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-            torch.save(state_dict, checkpoint)
-            lm_checkpoint(
-                lm_config, 
-                weight=args.save_weight, 
-                model=model, 
-                optimizer=optimizer,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir='../checkpoints',
-            )
-            model.train()
-            del state_dict
-
-        del X, Y, loss_mask, res, loss
-    
-
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretrain")
@@ -226,10 +139,10 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
 
     # 配置模型参数
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
+    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
 
     # 读取checkpoint数据
-    checkpoint_data = lm_checkpoint(lm_config, args.from_weight,save_dir="../checkpoints") if args.from_resume == 1 else None
+    checkpoint_data = lm_checkpoint(lm_config, args.save_weight, save_dir="../checkpoints") if args.from_resume == 1 else None
 
     # ========== 3 ==========
     # 设置混合精度
@@ -243,7 +156,7 @@ if __name__ == "__main__":
 
     # ========== 4 ==========
     # 配置wandb
-    if args.use_wandb:
+    if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = checkpoint_data["wandb_id"] if checkpoint_data else None
         resume = "must" if wandb_id else None
@@ -296,30 +209,30 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-            if epoch == start_epoch and start_step > 0:
-                batch_sampler = SkipBatchSampler(
-                    train_sampler or range(len(train_ds)),
-                    args.batch_size,
-                    start_step + 1
-                )
-                loader = DataLoader(
-                    train_ds, 
-                    batch_sampler=batch_sampler,
-                    num_workers=args.num_workers,
-                    pin_memory=True
-                )
-                Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-                train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-            else:
-                loader = DataLoader(
-                    train_ds, 
-                    batch_size=args.batch_size, 
-                    shuffle=(train_sampler is None),
-                    sampler=train_sampler,
-                    num_workers=args.num_workers,
-                    pin_memory=True
-                )
-                train_epoch(epoch, loader, len(loader), 0, wandb)
+        if epoch == start_epoch and start_step > 0:
+            batch_sampler = SkipBatchSampler(
+                train_sampler or range(len(train_ds)),
+                args.batch_size,
+                start_step + 1
+            )
+            loader = DataLoader(
+                train_ds, 
+                batch_sampler=batch_sampler,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+        else:
+            loader = DataLoader(
+                train_ds, 
+                batch_size=args.batch_size, 
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+            train_epoch(epoch, loader, len(loader), 0, wandb)
                 
                 
 # torchrun --nproc_per_node 1 train_pretrain.py 
