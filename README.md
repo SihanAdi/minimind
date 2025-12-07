@@ -381,5 +381,7 @@ $\mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace
         - 通过偏好对比，无需显式计算优势
     - 正则项: $h(\text{KL}_t)$ = 隐含在 $\beta$ 中
         - 控制偏离参考模型程度
+    - w: chosen
+    - l: rejected
 
 
