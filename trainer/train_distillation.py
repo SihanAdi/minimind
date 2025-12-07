@@ -323,4 +323,4 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader), teacher_model, lm_config_student, 0, wandb, args.alpha, args.temperature)
                 
                 
-# torchrun --nproc_per_node 1 train_full_sft.py 
+# torchrun --nproc_per_node 1 train_distillation.py 
