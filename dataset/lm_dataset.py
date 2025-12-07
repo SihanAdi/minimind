@@ -173,7 +173,44 @@ class DPODataset(Dataset):
         return loss_mask
     
     def __getitem__(self, index):
-        pass
+        item = self.samples[index]
+        chosen = item["chosen"]
+        rejected = item["rejected"]
+        
+        chosen_prompt = self.tokenizer.apply_chat_template(
+            chosen, tokenizer=False, add_generation_prompt=False
+        )
+        rejected_prompt = self.tokenizer.apply_chat_template(
+            rejected, tokenizer=False, add_generation_prompt=False
+        )
+        
+        chosen_embedding = self.tokenizer(
+            chosen_prompt, truncation=True, max_length=self.max_length, padding="max_length"
+        )
+        rejected_embedding = self.tokenizer(
+            rejected_prompt, truncation=True, max_length=self.max_length, padding="max_length"
+        )
+        
+        chosen_input_ids = chosen_embedding["input_ids"]
+        chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)
+        rejected_input_ids = chosen_embedding["input_ids"]
+        rejected_loss_mask = self._generate_loss_mask(rejected_input_ids)
+        
+        x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
+        y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
+        mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
+        y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
+        mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
+        
+        return {
+            'x_chosen': x_chosen,
+            'y_chosen': y_chosen,
+            'mask_chosen': mask_chosen,
+            'x_rejected': x_rejected,
+            'y_rejected': y_rejected,
+            'mask_rejected': mask_rejected
+        }
 
 
 if __name__ == "__main__":
