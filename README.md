@@ -333,3 +333,53 @@ f(0.5) = 0.25    # 减少0.75
 4. **训练动态**：这种不对称性为模型提供了明确的优化方向
 
 这种精心设计的不对称性确保了MoE系统能够有效地学习到负载均衡的路由策略，是所有MoE模型成功的关键因素之一。
+
+# 强化学习
+
+## RLHF - 基于人类反馈的强化学习
+- 通过人类对模型输出的偏好进行评价来训练模型，使其生成更符合人类价值观和偏好的内容
+- 优点：
+    - 更贴近真实人类偏好
+- 缺点：
+    - 成本高
+    - 效率低
+
+## RLAIF - 基于AI反馈的强化学习
+- 使用AI模型（通常是预训练的语言奖励模型）来提供反馈，而不直接依赖人类的人工标注
+- 优点：
+    - 自动化
+    - 可扩展性强
+- 缺点：
+    - 可能偏离人类真实偏好
+
+- RLHF 和 RLAIF 除了反馈的来源不同，其他并无任何区别
+
+## Policy Optimization (PO)
+- 优化期望：训练时，只需**最小化负目标函数**，即: $\mathcal{L_{PO}}=-\mathcal{J_{PO}}$
+$$\mathcal{J}_{PO} = \mathbb{E}_{q \sim P(Q), o \sim \pi(O|q)} \left[ \underbrace{f(r_t)}_{\text{策略项}} \cdot \underbrace{g(A_t)}_{\text{优势项}} - \underbrace{h(\text{KL}_t)}_{\text{正则项}} \right]$$
+
+    - 问题/提示词  $q$: 从数据集 $P(Q)$ 中采样
+    - 模型输出序列 $o$: 由策略 $\pi$ 生成 
+    - 策略项 $f(r_t)$: 告诉模型新旧策略偏差有多大，是否探索到了更好的token; 如何使用概率比 $r_t$? 
+        - $r_t = \frac{\pi_\theta(o_t\|q, o_{<t})}{\pi_{ref}(o_t\|q, o_{<t})}$ $(0, +\infty)$
+    - 优势项 $g(A_t)$: 衡量某个动作相比基线有多好; 如何计算优势 $A_t$
+    - 正则项 $h(\text{KL}_t)$: 既防止跑偏又防止管的太死, 防止策略偏离参考模型太远; 如何约束变化幅度 $\text{KL}_t$
+
+### Direct Preference Optimization - 直接偏好优化算法（DPO）
+- 直接最大化"chosen优于rejected"的对数几率
+- 无需同步训练Reward/Value模型
+- DPO只需跑actor与ref两个模型，显存占用低、收敛稳定、实现简单
+- off‑policy：使用静态偏好数据集，可反复多轮epoch
+    - Ref模型固定（预先缓存输出）
+- 局限在于不做在线探索，更多用于"偏好/安全"的人类价值对齐
+- 对"能不能做对题"的智力能力提升有限（当然这也取决于数据集，大规模收集正反样本并人类评估很困难）
+- 损失函数: 
+    $$\mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right]$$
+    - 策略项: $f(r_t) = \log r_w - \log r_l$
+        - 对比chosen vs rejected的概率比
+    - 优势项: $g(A_t)$ = 无
+        - 通过偏好对比，无需显式计算优势
+    - 正则项: $h(\text{KL}_t)$ = 隐含在 $\beta$ 中
+        - 控制偏离参考模型程度
+
+

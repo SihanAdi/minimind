@@ -133,6 +133,31 @@ class SFTDataset(Dataset):
         return X, Y, loss_mask
         
 
+class DPODataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=4096):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant", add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f"{tokenizer.eos_token}", add_special_tokens=False).input_ids
+        self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.samples = self.load_data(jsonl_path)
+        
+    def load_data(self, path):
+        samples = []
+        with open(path, "r", encoding='utf-8') as f:
+            for i, row in enumerate(f, 1):
+                data = json.loads(row.strip())
+                samples.append(data)
+        return samples
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, index):
+        pass
+
+
 if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("../model_weights")
     pretrain_dataset = PretrainDataset("./pretrain_hq.jsonl", tokenizer)
