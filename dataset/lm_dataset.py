@@ -211,6 +211,50 @@ class DPODataset(Dataset):
             'y_rejected': y_rejected,
             'mask_rejected': mask_rejected
         }
+        
+
+class RLAIFDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = self.load_data(jsonl_path)
+        self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant", add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f"{tokenizer.eos_token}", add_special_tokens=False).input_ids
+
+    def load_data(self, path):
+        samples = []
+        with open(path, "r", encoding='utf-8') as f:
+            for i, row in enumerate(f, 1):
+                data = json.loads(row.strip())
+                samples.append(data)
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _create_chat_template(self, conversations):
+        messages = []
+        answer = ""
+
+        for i, msg in enumerate(conversations):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": msg["content"]})
+
+            answer = msg["content"]
+
+        return self.tokenizer.apply_chat_template(
+            messages[:-1], tokenizer=False, add_generation_prompt=True
+        ), answer
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        prompt, answer = self._create_chat_template(sample["conversations"])
+
+        return {
+            "prompt": prompt,
+            "answer": answer
+        }
 
 
 if __name__ == "__main__":
